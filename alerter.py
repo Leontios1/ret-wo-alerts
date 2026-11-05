@@ -29,6 +29,7 @@ import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -92,7 +93,7 @@ def _score_line(competitors):
 
 
 def parse_espn(data, tour):
-    """Yield alert dicts for retired/walkover/defaulted matches in an ESPN scoreboard payload."""
+    """Yield alert dicts for walkovers in an ESPN scoreboard payload (retirements/defaults skipped)."""
     for event in data.get("events", []) or []:
         tournament = event.get("name") or event.get("shortName") or "Tournament"
         for group in event.get("groupings", []) or []:
@@ -106,7 +107,7 @@ def parse_espn(data, tour):
                     outcome = classify(text)
                     if outcome:
                         break
-                if not outcome:
+                if outcome != "Walkover":  # tennis: walkovers only (no retirements/defaults)
                     continue
                 comps = comp.get("competitors") or []
                 names = [_player_name(c) for c in comps]
@@ -119,8 +120,9 @@ def parse_espn(data, tour):
                     "round": (comp.get("round") or {}).get("displayName", ""),
                     "match": " vs ".join(names),
                     "winner": winner,
-                    "score": _score_line(comps) if outcome != "Walkover" else "",
+                    "score": "",
                     "note": notes.strip(),
+                    "times": [("Scheduled", comp.get("date") or comp.get("startDate"))],
                 }
 
 
@@ -141,7 +143,10 @@ def fetch_tennis():
 # ---------------------------------------------------------------- esports
 
 def parse_panda(matches):
-    """Yield alerts for forfeited matches and for series with a forfeited game."""
+    """Yield alerts for canceled matches (incl. forfeits) and series abandoned mid-way.
+    Postponed / rescheduled matches are ignored. PandaScore has no separate 'abandoned'
+    status: a match stopped after it began shows as canceled with a start time, or as a
+    series with forfeited games."""
     for m in matches or []:
         opp = [((o or {}).get("opponent") or {}) for o in m.get("opponents") or []]
         names = {o.get("id"): o.get("name") or o.get("acronym") or "?" for o in opp}
@@ -159,15 +164,28 @@ def parse_panda(matches):
             "match": " vs ".join(names.values()) or m.get("name", "?"),
             "winner": winner,
             "note": "",
+            "times": [("Scheduled", m.get("original_scheduled_at") or m.get("scheduled_at")),
+                      ("Started", m.get("begin_at")),
+                      ("Updated", m.get("modified_at"))],
         }
-        if m.get("forfeit"):
-            yield {**base, "id": f"esports:{m.get('id')}", "outcome": "Forfeit (walkover)", "score": ""}
+        status = m.get("status")
+        if status == "postponed":
+            continue
+        if status == "canceled":
+            if m.get("forfeit"):
+                outcome, note = "Canceled – forfeit", "Win awarded by forfeit"
+            elif m.get("begin_at"):
+                outcome, note = "Abandoned", "Match had started before it was canceled"
+            else:
+                outcome, note = "Canceled", ""
+            yield {**base, "id": f"esports:{m.get('id')}", "outcome": outcome,
+                   "score": score if outcome == "Abandoned" else "", "note": note}
             continue
         forfeited_games = [g for g in m.get("games") or [] if g.get("forfeit")]
         if forfeited_games:
             nums = ", ".join(str(g.get("position", "?")) for g in forfeited_games)
             yield {**base, "id": f"esports:{m.get('id')}:games",
-                   "outcome": "Map/game forfeited mid-series", "score": score,
+                   "outcome": "Abandoned mid-series", "score": score,
                    "note": f"Forfeited game(s): {nums}"}
 
 
@@ -190,6 +208,28 @@ def fetch_esports():
 
 # ---------------------------------------------------------------- telegram
 
+def _local_tz():
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(os.environ.get("TIMEZONE", "Europe/Athens"))
+    except Exception:
+        return timezone.utc
+
+
+def fmt_time(value):
+    """ISO string from the APIs -> 'Thu 5 Nov, 14:30' in local time (default Europe/Athens)."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(_local_tz())
+        return f"{dt:%a} {dt.day} {dt:%b}, {dt:%H:%M}"
+    except Exception:
+        return None
+
+
 def format_alert(a):
     lines = [f"<b>{esc(a['outcome'].upper())}</b> · {esc(a['sport'])}",
              f"<b>{esc(a['match'])}</b>"]
@@ -201,17 +241,33 @@ def format_alert(a):
         lines.append(f"Advances/wins: {esc(a['winner'])}")
     if a.get("note"):
         lines.append(f"<i>{esc(a['note'])}</i>")
+    labels = {"Scheduled": "🕒 Scheduled", "Started": "▶️ Started", "Updated": "📝 Status changed"}
+    for label, value in a.get("times") or []:
+        t = fmt_time(value)
+        if t:
+            lines.append(f"{labels.get(label, label)}: {t}")
+    lines.append(f"🔔 Detected: {fmt_time(datetime.now(timezone.utc).isoformat())}")
     return "\n".join(lines)
 
 
 def send_telegram(text):
     token = os.environ["TELEGRAM_BOT_TOKEN"]
-    chat = os.environ["TELEGRAM_CHAT_ID"]
+    chat = os.environ["TELEGRAM_CHAT_ID"].strip()
     body = urllib.parse.urlencode({"chat_id": chat, "text": text, "parse_mode": "HTML",
                                    "disable_web_page_preview": "true"}).encode()
-    req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=body, headers=UA)
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return json.loads(r.read().decode())
+    req = urllib.request.Request(f"https://api.telegram.org/bot{token.strip()}/sendMessage", data=body, headers=UA)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            desc = json.loads(e.read().decode()).get("description", "")
+        except Exception:
+            desc = ""
+        hint = {401: "TELEGRAM_BOT_TOKEN secret is wrong",
+                400: "TELEGRAM_CHAT_ID secret is wrong (or you haven't pressed Start in the bot)",
+                403: "the bot can't message you: open it in Telegram and press Start"}.get(e.code, "")
+        raise RuntimeError(f"Telegram error {e.code}: {desc}" + (f" -> {hint}" if hint else "")) from None
 
 
 # ---------------------------------------------------------------- state + main
@@ -269,7 +325,10 @@ def main():
     args = p.parse_args()
 
     if args.test:
-        send_telegram("✅ Retirement/walkover alerter is connected.")
+        try:
+            send_telegram("✅ Walkover / canceled alerter is connected.")
+        except Exception as e:
+            sys.exit(f"TEST FAILED: {e}")
         print("Test message sent.")
         return
     if not args.dry_run and not (os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID")):
