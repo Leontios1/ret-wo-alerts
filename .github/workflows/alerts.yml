@@ -4,6 +4,15 @@ on:
   schedule:
     - cron: "*/5 * * * *"   # every 5 min (GitHub's minimum; runs can be a few minutes late)
   workflow_dispatch:         # lets you run it manually from the Actions tab
+    inputs:
+      mode:
+        description: "What to do"
+        type: choice
+        default: normal
+        options:
+          - normal   # regular check, only new results
+          - test     # just send a 'connected' message to Telegram
+          - replay   # send alerts for every result currently found (to test real alerts)
 
 concurrency:
   group: alerts
@@ -17,21 +26,27 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Restore seen-matches state
+        if: inputs.mode != 'replay'
         uses: actions/cache/restore@v4
         with:
           path: seen.json
           key: seen-${{ github.run_id }}
           restore-keys: seen-
 
-      - name: Check for retirements / walkovers / forfeits
+      - name: Check for walkovers / canceled / abandoned matches
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           PANDASCORE_TOKEN:   ${{ secrets.PANDASCORE_TOKEN }}
-        run: python alerter.py
+          MODE: ${{ inputs.mode || 'normal' }}
+        run: |
+          if [ "$MODE" = "test" ]; then python3 alerter.py --test
+          elif [ "$MODE" = "replay" ]; then python3 alerter.py --alert-existing
+          else python3 alerter.py
+          fi
 
       - name: Save state
-        if: always()
+        if: always() && inputs.mode != 'test'
         uses: actions/cache/save@v4
         with:
           path: seen.json
